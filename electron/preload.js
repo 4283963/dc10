@@ -12,5 +12,12 @@ contextBridge.exposeInMainWorld('quantAPI', {
     const listener = (_event, msg) => callback(msg)
     ipcRenderer.on('python:error', listener)
     return () => ipcRenderer.removeListener('python:error', listener)
-  }
+  },
+  onAlert: (callback) => {
+    const listener = (_event, msg) => callback(msg)
+    ipcRenderer.on('md:alert', listener)
+    return () => ipcRenderer.removeListener('md:alert', listener)
+  },
+  playBeep: () => ipcRenderer.invoke('app:playBeep'),
+  showNotification: (opts) => ipcRenderer.invoke('app:showNotification', opts),
 })

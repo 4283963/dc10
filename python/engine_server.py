@@ -5,11 +5,12 @@ import json
 import socket
 import threading
 import traceback
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from backtest_engine import MAStrategy, load_csv_bars
+from market_data_engine import MarketDataEngine, Tick, SpreadAlert
 
 
 class EngineServer:
@@ -21,6 +22,14 @@ class EngineServer:
         self._running = False
         self._send_lock = threading.Lock()
         self._buffer = ""
+
+        self.md_engine: Optional[MarketDataEngine] = None
+        self._md_lock = threading.Lock()
+        self._tick_rate_limit_ms = 200
+        self._last_tick_sent: Dict[str, int] = {}
+        self._md_send_thread: Optional[threading.Thread] = None
+        self._md_snap_queue: List[Dict[str, Any]] = []
+        self._md_running = False
 
     def _send(self, msg: Dict[str, Any]) -> None:
         if not self.client_socket:
@@ -62,6 +71,24 @@ class EngineServer:
 
             elif action == "generate_sample":
                 self._generate_sample(req_id, req.get("params", {}))
+
+            elif action == "start_monitor":
+                self._start_monitor(req_id, req.get("params", {}))
+
+            elif action == "stop_monitor":
+                self._stop_monitor(req_id)
+
+            elif action == "get_monitor_snapshot":
+                self._get_monitor_snapshot(req_id)
+
+            elif action == "get_alert_history":
+                self._get_alert_history(req_id, req.get("params", {}))
+
+            elif action == "get_exchange_configs":
+                self._get_exchange_configs(req_id)
+
+            elif action == "set_spread_threshold":
+                self._set_spread_threshold(req_id, req.get("params", {}))
 
             else:
                 self._respond(req_id, False, error=f"Unknown action: {action}")
@@ -211,6 +238,143 @@ class EngineServer:
             "symbol": symbol,
         })
 
+    def _on_md_tick(self, tick: Tick) -> None:
+        key = f"{tick.exchange}_{tick.symbol}"
+        with self._md_lock:
+            if not self._md_running:
+                return
+            now_ms = int(tick.timestamp)
+            last = self._last_tick_sent.get(key, 0)
+            if now_ms - last < self._tick_rate_limit_ms:
+                return
+            self._last_tick_sent[key] = now_ms
+            self._md_snap_queue.append(tick.to_dict())
+
+    def _on_md_alert(self, alert: SpreadAlert) -> None:
+        with self._md_lock:
+            if not self._md_running:
+                return
+        alert_dict = alert.to_dict()
+        threshold_pct = alert_dict.pop("threshold_pct", False)
+        alert_dict["threshold_type"] = "bp" if threshold_pct else "absolute"
+        self._stream("md_alert", alert_dict)
+
+    def _md_send_worker(self) -> None:
+        import time
+        while True:
+            with self._md_lock:
+                if not self._md_running:
+                    break
+                queue_snapshot = self._md_snap_queue
+                self._md_snap_queue = []
+            if queue_snapshot:
+                self._stream("md_tick_batch", queue_snapshot)
+            time.sleep(0.05)
+
+    def _start_monitor(self, req_id: str, params: Dict[str, Any]) -> None:
+        with self._md_lock:
+            if self.md_engine is not None and self._md_running:
+                self._respond(req_id, True, {"running": True, "message": "Already running"})
+                return
+
+            if self.md_engine is None:
+                self.md_engine = MarketDataEngine(
+                    on_tick=self._on_md_tick,
+                    on_alert=self._on_md_alert,
+                )
+
+            threshold = float(params.get("threshold", 20))
+            threshold_type = params.get("threshold_type", "bp")
+            use_pct = threshold_type == "bp"
+            cooldown_ms = int(params.get("cooldown_ms", 5000))
+            exchanges = params.get("exchanges")
+
+            self.md_engine.set_threshold(threshold, use_pct)
+            self.md_engine.set_cooldown(cooldown_ms)
+            self._md_running = True
+            self._last_tick_sent.clear()
+            self._md_snap_queue.clear()
+
+            self.md_engine.start(exchange_ids=exchanges)
+
+            self._md_send_thread = threading.Thread(
+                target=self._md_send_worker,
+                daemon=True,
+                name="MD-Send",
+            )
+            self._md_send_thread.start()
+
+        configs = self.md_engine.get_exchange_configs()
+        exchange_list = [
+            {"exchange": exch_id, "name": cfg["name"], "symbols": cfg["symbols"]}
+            for exch_id, cfg in configs.items()
+        ]
+        self._respond(req_id, True, {
+            "running": True,
+            "gateway_count": len(configs),
+            "exchanges": exchange_list,
+            "threshold": threshold,
+            "threshold_type": threshold_type,
+            "cooldown_ms": cooldown_ms,
+        })
+        self._log("info", "Market data monitor started")
+
+    def _stop_monitor(self, req_id: str) -> None:
+        with self._md_lock:
+            self._md_running = False
+            if self.md_engine is not None:
+                self.md_engine.stop()
+                self.md_engine = None
+            if self._md_send_thread is not None:
+                self._md_send_thread = None
+            self._md_snap_queue.clear()
+            self._last_tick_sent.clear()
+        self._respond(req_id, True, {"running": False})
+        self._log("info", "Market data monitor stopped")
+
+    def _get_monitor_snapshot(self, req_id: str) -> None:
+        with self._md_lock:
+            if self.md_engine is None or not self._md_running:
+                self._respond(req_id, True, {"running": False, "snapshot": {}})
+                return
+            snapshot = self.md_engine.get_latest_snapshot()
+        self._respond(req_id, True, {"running": True, "snapshot": snapshot})
+
+    def _get_alert_history(self, req_id: str, params: Dict[str, Any]) -> None:
+        limit = int(params.get("limit", 100))
+        with self._md_lock:
+            if self.md_engine is None:
+                self._respond(req_id, True, {"alerts": []})
+                return
+            alerts = self.md_engine.get_alert_history(limit=limit)
+        self._respond(req_id, True, {"alerts": alerts})
+
+    def _get_exchange_configs(self, req_id: str) -> None:
+        from market_data_engine import EXCHANGE_CONFIGS
+        exchange_list = []
+        for exch_id, cfg in EXCHANGE_CONFIGS.items():
+            exchange_list.append({
+                "exchange": exch_id,
+                "name": cfg["name"],
+                "symbols": list(cfg["symbols"]),
+            })
+        self._respond(req_id, True, {"exchanges": exchange_list})
+
+    def _set_spread_threshold(self, req_id: str, params: Dict[str, Any]) -> None:
+        threshold = float(params.get("threshold", 20))
+        threshold_type = params.get("threshold_type", "bp")
+        use_pct = threshold_type == "bp"
+        cooldown_ms = int(params.get("cooldown_ms", 5000))
+        with self._md_lock:
+            if self.md_engine is not None:
+                self.md_engine.set_threshold(threshold, use_pct)
+                self.md_engine.set_cooldown(cooldown_ms)
+        self._respond(req_id, True, {
+            "threshold": threshold,
+            "threshold_type": threshold_type,
+            "cooldown_ms": cooldown_ms,
+        })
+
     def _read_lines(self, sock: socket.socket):
         buf = b""
         while self._running:
@@ -252,6 +416,15 @@ class EngineServer:
                 print(f"[EngineServer] Client connected from {addr}", flush=True)
                 self.client_socket = client
                 self._read_lines(client)
+                with self._md_lock:
+                    self._md_running = False
+                    if self.md_engine is not None:
+                        try:
+                            self.md_engine.stop()
+                        except Exception:
+                            pass
+                        self.md_engine = None
+                    self._md_snap_queue.clear()
                 self.client_socket = None
             except Exception as e:
                 if self._running:

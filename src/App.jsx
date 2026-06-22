@@ -4,10 +4,12 @@ import KLineChart from './components/KLineChart.jsx'
 import EquityChart from './components/EquityChart.jsx'
 import MetricsCards from './components/MetricsCards.jsx'
 import ProgressOverlay from './components/ProgressOverlay.jsx'
+import MonitorPanel from './components/MonitorPanel.jsx'
 
 const isElectron = window && window.quantAPI && typeof window.quantAPI.sendRequest === 'function'
 
 export default function App() {
+  const [activeTab, setActiveTab] = useState('backtest')
   const [bridgeStatus, setBridgeStatus] = useState({ state: 'loading', message: '正在启动 Python 引擎...' })
   const [csvPath, setCsvPath] = useState('')
   const [csvPreview, setCsvPreview] = useState(null)
@@ -34,6 +36,9 @@ export default function App() {
 
   const msgUnsub = useRef(null)
   const errUnsub = useRef(null)
+  const alertUnsub = useRef(null)
+  const mdTickHandler = useRef(null)
+  const mdAlertHandler = useRef(null)
 
   useEffect(() => {
     if (!isElectron) {
@@ -51,11 +56,17 @@ export default function App() {
       console.error('Python error:', err)
       setBridgeStatus({ state: 'error', message: err.message || 'Python 引擎异常' })
     })
+    alertUnsub.current = window.quantAPI.onAlert((alertData) => {
+      if (mdAlertHandler.current) {
+        mdAlertHandler.current(alertData)
+      }
+    })
 
     return () => {
       clearTimeout(t)
       if (msgUnsub.current) msgUnsub.current()
       if (errUnsub.current) errUnsub.current()
+      if (alertUnsub.current) alertUnsub.current()
     }
   }, [])
 
@@ -79,6 +90,14 @@ export default function App() {
       } else if (msg.stream === 'result') {
         setSummary(msg.data?.summary || null)
         setTrades(msg.data?.trades || [])
+      } else if (msg.stream === 'md_tick_batch') {
+        if (mdTickHandler.current) {
+          mdTickHandler.current(msg.data || [])
+        }
+      } else if (msg.stream === 'md_alert') {
+        if (mdAlertHandler.current) {
+          mdAlertHandler.current(msg.data)
+        }
       }
     } else if (msg.type === 'log') {
       console.log(`[Python ${msg.level}] ${msg.message}`)
@@ -164,74 +183,102 @@ export default function App() {
     }
   }
 
+  const handleTabChange = (tabId) => {
+    setActiveTab(tabId)
+  }
+
+  const renderBacktestTab = () => (
+    <div className="main-content">
+      <aside className="sidebar">
+        <ControlPanel
+          csvPath={csvPath}
+          csvPreview={csvPreview}
+          config={config}
+          setConfig={setConfig}
+          onSelectFile={handleSelectFile}
+          onGenerateSample={handleGenerateSample}
+          onStart={handleStartBacktest}
+          isRunning={isRunning}
+          disabled={!isElectron}
+        />
+      </aside>
+
+      <section className="chart-area">
+        <MetricsCards summary={summary} />
+
+        <div className="chart-card kline-card">
+          <div className="chart-header">
+            <div className="chart-title">
+              <span>K 线图 &amp; 买卖信号</span>
+              {trades.length > 0 && (
+                <span className="trade-count-badge">{trades.length} 笔交易</span>
+              )}
+            </div>
+          </div>
+          <div className="chart-container">
+            {klines.length === 0 ? (
+              <div className="empty-state">
+                <div className="empty-icon">📈</div>
+                <div className="empty-title">暂无 K 线数据</div>
+                <div className="empty-desc">
+                  选择本地 CSV 历史行情文件，或生成示例数据后，点击"开始回测"按钮
+                </div>
+              </div>
+            ) : (
+              <KLineChart klines={klines} indicators={indicators} signals={signals} />
+            )}
+          </div>
+        </div>
+
+        <div className="chart-card equity-card">
+          <div className="chart-header">
+            <div className="chart-title">权益曲线 / 资金走势</div>
+          </div>
+          <div className="chart-container">
+            {equityCurve.length === 0 ? (
+              <div className="empty-state">
+                <div className="empty-icon">💰</div>
+                <div className="empty-title">暂无权益数据</div>
+              </div>
+            ) : (
+              <EquityChart equityCurve={equityCurve} initialCapital={config.initialCapital} />
+            )}
+          </div>
+        </div>
+      </section>
+    </div>
+  )
+
   return (
     <div className="app-layout">
       <header className="app-header">
         <div className="app-title">QuantLab · 量化策略回测与行情监控台</div>
-        <div className="app-subtitle">A 股 & 商品期货 | Tick 级数据</div>
+        <div className="app-subtitle">A 股 &amp; 商品期货 | Tick 级数据</div>
+        <div className="tab-bar">
+          <div
+            className={`tab-btn ${activeTab === 'backtest' ? 'active' : ''}`}
+            onClick={() => handleTabChange('backtest')}
+          >
+            📊 策略回测
+          </div>
+          <div
+            className={`tab-btn ${activeTab === 'monitor' ? 'active' : ''}`}
+            onClick={() => handleTabChange('monitor')}
+          >
+            🔴 实时行情监控
+          </div>
+        </div>
         <div className={`status-dot ${bridgeStatus.state}`} />
         <div className="status-text">{bridgeStatus.message}</div>
       </header>
 
-      <div className="main-content">
-        <aside className="sidebar">
-          <ControlPanel
-            csvPath={csvPath}
-            csvPreview={csvPreview}
-            config={config}
-            setConfig={setConfig}
-            onSelectFile={handleSelectFile}
-            onGenerateSample={handleGenerateSample}
-            onStart={handleStartBacktest}
-            isRunning={isRunning}
-            disabled={!isElectron}
-          />
-        </aside>
-
-        <section className="chart-area">
-          <MetricsCards summary={summary} />
-
-          <div className="chart-card kline-card">
-            <div className="chart-header">
-              <div className="chart-title">
-                <span>K 线图 &amp; 买卖信号</span>
-                {trades.length > 0 && (
-                  <span className="trade-count-badge">{trades.length} 笔交易</span>
-                )}
-              </div>
-            </div>
-            <div className="chart-container">
-              {klines.length === 0 ? (
-                <div className="empty-state">
-                  <div className="empty-icon">📈</div>
-                  <div className="empty-title">暂无 K 线数据</div>
-                  <div className="empty-desc">
-                    选择本地 CSV 历史行情文件，或生成示例数据后，点击"开始回测"按钮
-                  </div>
-                </div>
-              ) : (
-                <KLineChart klines={klines} indicators={indicators} signals={signals} />
-              )}
-            </div>
-          </div>
-
-          <div className="chart-card equity-card">
-            <div className="chart-header">
-              <div className="chart-title">权益曲线 / 资金走势</div>
-            </div>
-            <div className="chart-container">
-              {equityCurve.length === 0 ? (
-                <div className="empty-state">
-                  <div className="empty-icon">💰</div>
-                  <div className="empty-title">暂无权益数据</div>
-                </div>
-              ) : (
-                <EquityChart equityCurve={equityCurve} initialCapital={config.initialCapital} />
-              )}
-            </div>
-          </div>
-        </section>
-      </div>
+      {activeTab === 'backtest' ? renderBacktestTab() : (
+        <MonitorPanel
+          isElectron={isElectron}
+          setMdTickHandler={(fn) => { mdTickHandler.current = fn }}
+          setMdAlertHandler={(fn) => { mdAlertHandler.current = fn }}
+        />
+      )}
 
       {isRunning && (
         <ProgressOverlay
