@@ -50,12 +50,15 @@ class MAStrategy:
         total_bars = len(df)
         open_trade = None
 
+        pending_order = None
+
         for i in range(total_bars):
             row = df.iloc[i]
             ts = int(row["timestamp"])
-            close = float(row["close"])
+            open_price = float(row["open"])
             high = float(row["high"])
             low = float(row["low"])
+            close = float(row["close"])
 
             if on_progress and i % max(1, total_bars // 100) == 0:
                 on_progress(i, total_bars)
@@ -66,22 +69,9 @@ class MAStrategy:
             exit_reason = None
             exec_price = None
 
-            if position > 0 and open_trade is not None:
-                entry_price = open_trade["entry_price"]
-                if low <= entry_price * (1 - self.stop_loss_pct):
-                    exec_price = entry_price * (1 - self.stop_loss_pct)
-                    exit_reason = "stop_loss"
-                elif high >= entry_price * (1 + self.take_profit_pct):
-                    exec_price = entry_price * (1 + self.take_profit_pct)
-                    exit_reason = "take_profit"
-
-            if exit_reason is None and ma_fast is not None and ma_slow is not None and i >= self.slow_ma:
-                prev_ma_fast = float(df.iloc[i - 1]["ma_fast"]) if i > 0 else ma_fast
-                prev_ma_slow = float(df.iloc[i - 1]["ma_slow"]) if i > 0 else ma_slow
-
-                if position == 0 and prev_ma_fast <= prev_ma_slow and ma_fast > ma_slow:
-                    slippage_amt = close * self.slippage
-                    buy_price = close + slippage_amt
+            if pending_order is not None:
+                if pending_order["side"] == "buy" and position == 0:
+                    buy_price = open_price * (1 + self.slippage)
                     fee = buy_price * self.commission
                     if capital > fee:
                         tradable_capital = capital - fee
@@ -98,7 +88,8 @@ class MAStrategy:
                                     "type": "buy",
                                     "price": round(buy_price, 4),
                                     "qty": round(qty, 6),
-                                    "reason": "ma_cross_up",
+                                    "reason": pending_order["reason"],
+                                    "exec_at": "open",
                                 }
                                 signals.append(signal)
                                 open_trade = {
@@ -109,18 +100,80 @@ class MAStrategy:
                                 }
                                 if on_signal:
                                     on_signal(signal)
+                elif pending_order["side"] == "sell" and position > 0 and open_trade is not None:
+                    sell_price = open_price * (1 - self.slippage)
+                    qty = position
+                    revenue = qty * sell_price
+                    fee = revenue * self.commission
+                    net_revenue = revenue - fee
+                    capital += net_revenue
+                    pnl = (sell_price - open_trade["entry_price"]) * qty - fee - (open_trade["entry_price"] * qty * self.commission)
+                    trades.append({
+                        "entry_index": open_trade["entry_index"],
+                        "entry_ts": open_trade["entry_ts"],
+                        "entry_price": round(open_trade["entry_price"], 4),
+                        "exit_index": i,
+                        "exit_ts": ts,
+                        "exit_price": round(sell_price, 4),
+                        "qty": round(qty, 6),
+                        "pnl": round(pnl, 4),
+                        "pnl_pct": round((sell_price / open_trade["entry_price"] - 1) * 100, 4),
+                        "exit_reason": pending_order["reason"],
+                    })
+                    signal = {
+                        "index": i,
+                        "timestamp": ts,
+                        "type": "sell",
+                        "price": round(sell_price, 4),
+                        "qty": round(qty, 6),
+                        "reason": pending_order["reason"],
+                        "pnl": round(pnl, 4),
+                        "exec_at": "open",
+                    }
+                    signals.append(signal)
+                    if on_signal:
+                        on_signal(signal)
+                    position = 0.0
+                    avg_cost = 0.0
+                    open_trade = None
+                pending_order = None
 
-                elif position > 0 and prev_ma_fast >= prev_ma_slow and ma_fast < ma_slow:
-                    exec_price = close * (1 - self.slippage)
-                    exit_reason = "ma_cross_down"
+            if position > 0 and open_trade is not None and exit_reason is None:
+                entry_price = open_trade["entry_price"]
+                stop_price = entry_price * (1 - self.stop_loss_pct)
+                target_price = entry_price * (1 + self.take_profit_pct)
+
+                hit_stop = low <= stop_price
+                hit_target = high >= target_price
+
+                if hit_stop and hit_target:
+                    dist_to_stop = abs(open_price - stop_price)
+                    dist_to_target = abs(open_price - target_price)
+                    if dist_to_stop <= dist_to_target:
+                        exec_price = stop_price * (1 - self.slippage)
+                        exit_reason = "stop_loss"
+                    else:
+                        exec_price = target_price * (1 - self.slippage)
+                        exit_reason = "take_profit"
+                elif hit_stop:
+                    exec_price = stop_price * (1 - self.slippage)
+                    exit_reason = "stop_loss"
+                elif hit_target:
+                    exec_price = target_price * (1 - self.slippage)
+                    exit_reason = "take_profit"
 
             if exit_reason is not None and position > 0 and open_trade is not None:
                 qty = position
-                revenue = qty * exec_price
-                fee = revenue * self.commission
-                net_revenue = revenue - fee
-                capital += net_revenue
-                pnl = (exec_price - open_trade["entry_price"]) * qty - fee - (open_trade["entry_price"] * qty * self.commission)
+                fee = abs(exec_price * qty * self.commission)
+                if exec_price > 0:
+                    revenue = qty * exec_price
+                    net_revenue = revenue - fee
+                    capital += net_revenue
+                    pnl = (exec_price - open_trade["entry_price"]) * qty - fee - (open_trade["entry_price"] * qty * self.commission)
+                else:
+                    pnl = -capital
+                    capital = 0.0
+
                 trades.append({
                     "entry_index": open_trade["entry_index"],
                     "entry_ts": open_trade["entry_ts"],
@@ -141,6 +194,7 @@ class MAStrategy:
                     "qty": round(qty, 6),
                     "reason": exit_reason,
                     "pnl": round(pnl, 4),
+                    "exec_at": "intraday",
                 }
                 signals.append(signal)
                 if on_signal:
@@ -148,6 +202,19 @@ class MAStrategy:
                 position = 0.0
                 avg_cost = 0.0
                 open_trade = None
+                pending_order = None
+
+            if i >= self.slow_ma and ma_fast is not None and ma_slow is not None:
+                prev_ma_fast = float(df.iloc[i - 1]["ma_fast"]) if i > 0 else ma_fast
+                prev_ma_slow = float(df.iloc[i - 1]["ma_slow"]) if i > 0 else ma_slow
+
+                if position == 0 and pending_order is None:
+                    if prev_ma_fast <= prev_ma_slow and ma_fast > ma_slow:
+                        pending_order = {"side": "buy", "reason": "ma_cross_up"}
+
+                elif position > 0 and pending_order is None:
+                    if prev_ma_fast >= prev_ma_slow and ma_fast < ma_slow:
+                        pending_order = {"side": "sell", "reason": "ma_cross_down"}
 
             equity = capital + position * close
             equity_curve.append((ts, round(equity, 4)))
@@ -183,6 +250,7 @@ class MAStrategy:
                 "qty": round(qty, 6),
                 "reason": "force_close",
                 "pnl": round(pnl, 4),
+                "exec_at": "close",
             })
             if on_signal:
                 on_signal(signals[-1])
@@ -213,7 +281,13 @@ class MAStrategy:
         ts_start = equity_curve[0][0]
         ts_end = equity_curve[-1][0]
         days = max((ts_end - ts_start) / 86400000, 0.001)
-        annual_return = ((final_equity / self.initial_capital) ** (365.0 / days) - 1) * 100 if days > 0 else 0.0
+        ratio = final_equity / self.initial_capital
+        if ratio > 0 and days > 0:
+            annual_return = (np.sign(ratio) * (abs(ratio) ** (365.0 / days)) - 1) * 100
+            if not np.isfinite(annual_return):
+                annual_return = 0.0
+        else:
+            annual_return = 0.0
 
         peak = np.maximum.accumulate(eq_arr)
         drawdown = (eq_arr - peak) / peak
