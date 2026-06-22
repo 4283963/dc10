@@ -1,35 +1,9 @@
-# Mac 系统垃圾文件
-.DS_Store
-.AppleDouble
-.LSOverride
-.Icon
-._*
-
-# Windows 系统垃圾文件
-Thumbs.db
-desktop.ini
-
-# 日志与临时文件
-*.log
-logs/
-*.tmp
-*.bak
-*.mp4
-# 开发工具缓存 (IDEA / VSCode)
-.idea/
-.vscode/
-*.suo
-*.user
-*.workspace
-.history/
-
-# 常见依赖与构建输出
 node_modules/
 dist/
-build/
-out/
-target/
-bin/
-obj/
-__pycache__/
-*.pyc
+release/
+.DS_Store
+*.log
+python/dist/
+python/build/
+python/*.spec
+python/__pycache__/

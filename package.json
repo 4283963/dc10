@@ -1,0 +1,48 @@
+{
+  "name": "quant-backtest-desktop",
+  "version": "1.0.0",
+  "description": "A股与商品期货高频量化策略回测与行情监控台",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "concurrently \"npm run dev:react\" \"npm run dev:electron\"",
+    "dev:react": "vite",
+    "dev:electron": "wait-on http://localhost:5173 && cross-env NODE_ENV=development electron .",
+    "build": "vite build",
+    "pack": "electron-builder --dir",
+    "dist": "vite build && electron-builder",
+    "build:python": "pyinstaller --onefile --name quant_engine python/engine_server.py --distpath python/dist"
+  },
+  "keywords": ["quant", "backtest", "electron", "trading"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "echarts": "^5.4.3",
+    "echarts-for-react": "^3.0.2",
+    "zeromq": "^6.0.4",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.2.1",
+    "vite": "^5.0.0",
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1",
+    "concurrently": "^8.2.2",
+    "wait-on": "^7.2.0",
+    "cross-env": "^7.0.3"
+  },
+  "build": {
+    "appId": "com.quant.backtest",
+    "productName": "QuantBacktest",
+    "directories": {
+      "output": "release"
+    },
+    "extraResources": [
+      {
+        "from": "python/dist",
+        "to": "python"
+      }
+    ]
+  }
+}
